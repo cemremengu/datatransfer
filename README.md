@@ -12,16 +12,19 @@ A high-performance Go tool that runs a configurable `SELECT` query and bulk-load
 ## Setup
 
 1. Install dependencies:
+
 ```bash
 go mod download
 ```
 
 2. Create a `.env` file based on `.env.example`:
+
 ```bash
 cp .env.example .env
 ```
 
 3. Update the `.env` file with your database credentials:
+
 ```
 DATABASE_URL=postgres://username:password@host:port/database?sslmode=disable
 DEST_TABLE=pm.snmp_metrics_interface
@@ -31,14 +34,20 @@ SELECT_QUERY=SELECT * FROM pm.snmp_metrics_interface_2 WHERE "timestamp" >= DATE
 ## Usage
 
 Run the script:
+
 ```bash
 go run main.go
 ```
 
 Or build and run:
+
 ```bash
 go build -o datatransfer.exe
 ./datatransfer.exe
+
+# On Linux
+
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 LDFLAGS="-s -w" go build .
 ```
 
 ## Configuration
@@ -57,6 +66,7 @@ Optional environment variables:
 ## Output
 
 The script logs:
+
 - Database connection status
 - Destination table and query
 - Detected result columns
