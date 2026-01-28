@@ -14,8 +14,10 @@ import (
 	"github.com/joho/godotenv"
 )
 
-const defaultBatchSize = 5000
-const defaultProgressEveryRows = int64(1_000_000)
+const (
+	defaultBatchSize         = 5000
+	defaultProgressEveryRows = int64(1_000_000)
+)
 
 type config struct {
 	databaseURL       string
@@ -161,7 +163,7 @@ func transferData(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
 		}
 
 		if err := insertBatch(ctx, pool, cfg.destTable, columns, batch); err != nil {
-			return fmt.Errorf("failed to insert batch: %w", err)
+			log.Printf("failed to insert batch: %s", err.Error())
 		}
 		processedCount += int64(len(batch))
 		batch = batch[:0]
@@ -179,7 +181,7 @@ func transferData(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
 
 	if len(batch) > 0 {
 		if err := insertBatch(ctx, pool, cfg.destTable, columns, batch); err != nil {
-			return fmt.Errorf("failed to insert final batch: %w", err)
+			log.Printf("failed to insert final batch: %s", err.Error())
 		}
 		processedCount += int64(len(batch))
 	}
