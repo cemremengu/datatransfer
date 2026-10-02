@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -25,6 +28,7 @@ type config struct {
 	destTable         pgx.Identifier
 	batchSize         int
 	progressEveryRows int64
+	rowOffset         int64
 }
 
 func main() {
@@ -37,7 +41,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ctx := context.Background()
+	// Cancel on Ctrl+C / SIGTERM so the transfer can stop cleanly and report
+	// the row offset to resume from.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	poolConfig, err := pgxpool.ParseConfig(cfg.databaseURL)
 	if err != nil {
@@ -56,6 +63,9 @@ func main() {
 	log.Println("Connected to database")
 
 	if err := transferData(ctx, pool, cfg); err != nil {
+		if errors.Is(err, context.Canceled) {
+			log.Fatalf("Transfer cancelled: %v", err)
+		}
 		log.Fatalf("Transfer failed: %v", err)
 	}
 
@@ -100,12 +110,22 @@ func loadConfig() (config, error) {
 		progressEveryRows = v
 	}
 
+	var rowOffset int64
+	if raw := strings.TrimSpace(os.Getenv("ROW_OFFSET")); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			return config{}, fmt.Errorf("invalid ROW_OFFSET: %q", raw)
+		}
+		rowOffset = v
+	}
+
 	return config{
 		databaseURL:       databaseURL,
 		selectQuery:       selectQuery,
 		destTable:         destTable,
 		batchSize:         batchSize,
 		progressEveryRows: progressEveryRows,
+		rowOffset:         rowOffset,
 	}, nil
 }
 
@@ -139,8 +159,11 @@ func transferData(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
 	log.Printf("Destination table: %s", strings.Join(cfg.destTable, "."))
 	log.Printf("Select query: %s", cfg.selectQuery)
 	log.Printf("Batch size: %d", cfg.batchSize)
+	if cfg.rowOffset > 0 {
+		log.Printf("Resuming from row offset: %d", cfg.rowOffset)
+	}
 
-	rows, columns, err := queryRows(ctx, pool, cfg.selectQuery)
+	rows, columns, err := queryRows(ctx, pool, buildQuery(cfg.selectQuery, cfg.rowOffset))
 	if err != nil {
 		return fmt.Errorf("failed to execute select query: %w", err)
 	}
@@ -151,10 +174,35 @@ func transferData(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
 	batch := make([][]any, 0, cfg.batchSize)
 	var processedCount int64
 
+	// nextOffset is the offset (relative to SELECT_QUERY) of the first row that
+	// has not been handled yet. Set ROW_OFFSET to this value to resume.
+	nextOffset := func() int64 { return cfg.rowOffset + processedCount }
+
+	abort := func(reason error) error {
+		log.Printf("Transfer stopped after %d rows. To resume, set ROW_OFFSET=%d", processedCount, nextOffset())
+		return fmt.Errorf("%w (resume with ROW_OFFSET=%d)", reason, nextOffset())
+	}
+
+	flush := func() error {
+		batchStart := nextOffset()
+		if err := insertBatch(ctx, pool, cfg.destTable, columns, batch); err != nil {
+			// A cancelled context means the batch was not written; stop here so
+			// the batch is retried on resume.
+			if ctx.Err() != nil {
+				return abort(ctx.Err())
+			}
+			log.Printf("failed to insert batch (rows %d-%d, retry with ROW_OFFSET=%d): %s",
+				batchStart, batchStart+int64(len(batch))-1, batchStart, err.Error())
+		}
+		processedCount += int64(len(batch))
+		batch = batch[:0]
+		return nil
+	}
+
 	for rows.Next() {
 		values, err := rows.Values()
 		if err != nil {
-			return err
+			return abort(err)
 		}
 
 		batch = append(batch, values)
@@ -162,32 +210,41 @@ func transferData(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
 			continue
 		}
 
-		if err := insertBatch(ctx, pool, cfg.destTable, columns, batch); err != nil {
-			log.Printf("failed to insert batch: %s", err.Error())
+		if err := flush(); err != nil {
+			return err
 		}
-		processedCount += int64(len(batch))
-		batch = batch[:0]
 
 		if processedCount%cfg.progressEveryRows == 0 {
 			elapsed := time.Since(startTime)
 			rate := float64(processedCount) / elapsed.Seconds()
-			log.Printf("Processed: %d rows - Rate: %.0f rows/sec", processedCount, rate)
+			log.Printf("Processed: %d rows (row offset %d) - Rate: %.0f rows/sec", processedCount, nextOffset(), rate)
 		}
 	}
 
 	if err := rows.Err(); err != nil {
-		return err
+		return abort(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return abort(err)
 	}
 
 	if len(batch) > 0 {
-		if err := insertBatch(ctx, pool, cfg.destTable, columns, batch); err != nil {
-			log.Printf("failed to insert final batch: %s", err.Error())
+		if err := flush(); err != nil {
+			return err
 		}
-		processedCount += int64(len(batch))
 	}
 
 	log.Printf("Transfer complete. Total: %d rows in %v", processedCount, time.Since(startTime))
 	return nil
+}
+
+// buildQuery wraps the select query to skip the first rowOffset rows.
+func buildQuery(selectQuery string, rowOffset int64) string {
+	if rowOffset <= 0 {
+		return selectQuery
+	}
+	selectQuery = strings.TrimRight(strings.TrimSpace(selectQuery), ";")
+	return fmt.Sprintf("SELECT * FROM (%s) AS src OFFSET %d", selectQuery, rowOffset)
 }
 
 func queryRows(ctx context.Context, pool *pgxpool.Pool, selectQuery string) (pgx.Rows, []string, error) {
