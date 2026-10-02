@@ -17,6 +17,7 @@ import (
 const (
 	defaultBatchSize         = 5000
 	defaultProgressEveryRows = int64(1_000_000)
+	cursorName               = "datatransfer_cursor"
 )
 
 type config struct {
@@ -24,6 +25,7 @@ type config struct {
 	selectQuery       string
 	destTable         pgx.Identifier
 	batchSize         int
+	fetchSize         int
 	progressEveryRows int64
 }
 
@@ -68,7 +70,8 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("DATABASE_URL environment variable is required")
 	}
 
-	selectQuery := strings.TrimSpace(os.Getenv("SELECT_QUERY"))
+	// DECLARE ... CURSOR FOR <query> does not accept a trailing semicolon.
+	selectQuery := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(os.Getenv("SELECT_QUERY")), ";"))
 	if selectQuery == "" {
 		return config{}, fmt.Errorf("SELECT_QUERY environment variable is required")
 	}
@@ -91,6 +94,15 @@ func loadConfig() (config, error) {
 		batchSize = v
 	}
 
+	fetchSize := batchSize
+	if raw := strings.TrimSpace(os.Getenv("FETCH_SIZE")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 {
+			return config{}, fmt.Errorf("invalid FETCH_SIZE: %q", raw)
+		}
+		fetchSize = v
+	}
+
 	progressEveryRows := defaultProgressEveryRows
 	if raw := strings.TrimSpace(os.Getenv("PROGRESS_EVERY_ROWS")); raw != "" {
 		v, err := strconv.ParseInt(raw, 10, 64)
@@ -105,6 +117,7 @@ func loadConfig() (config, error) {
 		selectQuery:       selectQuery,
 		destTable:         destTable,
 		batchSize:         batchSize,
+		fetchSize:         fetchSize,
 		progressEveryRows: progressEveryRows,
 	}, nil
 }
@@ -139,44 +152,83 @@ func transferData(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
 	log.Printf("Destination table: %s", strings.Join(cfg.destTable, "."))
 	log.Printf("Select query: %s", cfg.selectQuery)
 	log.Printf("Batch size: %d", cfg.batchSize)
+	log.Printf("Fetch size: %d", cfg.fetchSize)
 
-	rows, columns, err := queryRows(ctx, pool, cfg.selectQuery)
+	// The source query is read through a server-side cursor on its own
+	// connection, so at most fetchSize rows are requested from the server at
+	// a time. Batches are written through other pool connections.
+	conn, err := pool.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to execute select query: %w", err)
+		return fmt.Errorf("failed to acquire connection: %w", err)
 	}
-	defer rows.Close()
+	defer conn.Release()
 
-	log.Printf("Detected columns (%d): %s", len(columns), strings.Join(columns, ", "))
+	// Cursors only live inside a transaction.
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
 
+	declare := fmt.Sprintf("DECLARE %s NO SCROLL CURSOR FOR %s", cursorName, cfg.selectQuery)
+	if _, err := tx.Exec(ctx, declare); err != nil {
+		return fmt.Errorf("failed to declare cursor for select query: %w", err)
+	}
+
+	fetch := fmt.Sprintf("FETCH FORWARD %d FROM %s", cfg.fetchSize, cursorName)
 	batch := make([][]any, 0, cfg.batchSize)
+	var columns []string
 	var processedCount int64
 
-	for rows.Next() {
-		values, err := rows.Values()
+	for {
+		rows, err := tx.Query(ctx, fetch)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to fetch from cursor: %w", err)
 		}
 
-		batch = append(batch, values)
-		if len(batch) < cfg.batchSize {
-			continue
+		if columns == nil {
+			columns, err = columnNames(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			log.Printf("Detected columns (%d): %s", len(columns), strings.Join(columns, ", "))
 		}
 
-		if err := insertBatch(ctx, pool, cfg.destTable, columns, batch); err != nil {
-			log.Printf("failed to insert batch: %s", err.Error())
-		}
-		processedCount += int64(len(batch))
-		batch = batch[:0]
+		var fetched int
+		for rows.Next() {
+			values, err := rows.Values()
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			fetched++
 
-		if processedCount%cfg.progressEveryRows == 0 {
-			elapsed := time.Since(startTime)
-			rate := float64(processedCount) / elapsed.Seconds()
-			log.Printf("Processed: %d rows - Rate: %.0f rows/sec", processedCount, rate)
-		}
-	}
+			batch = append(batch, values)
+			if len(batch) < cfg.batchSize {
+				continue
+			}
 
-	if err := rows.Err(); err != nil {
-		return err
+			if err := insertBatch(ctx, pool, cfg.destTable, columns, batch); err != nil {
+				log.Printf("failed to insert batch: %s", err.Error())
+			}
+			processedCount += int64(len(batch))
+			batch = batch[:0]
+
+			if processedCount%cfg.progressEveryRows == 0 {
+				elapsed := time.Since(startTime)
+				rate := float64(processedCount) / elapsed.Seconds()
+				log.Printf("Processed: %d rows - Rate: %.0f rows/sec", processedCount, rate)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("failed to read fetched rows: %w", err)
+		}
+
+		if fetched < cfg.fetchSize {
+			break
+		}
 	}
 
 	if len(batch) > 0 {
@@ -186,24 +238,23 @@ func transferData(ctx context.Context, pool *pgxpool.Pool, cfg config) error {
 		processedCount += int64(len(batch))
 	}
 
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to close cursor transaction: %w", err)
+	}
+
 	log.Printf("Transfer complete. Total: %d rows in %v", processedCount, time.Since(startTime))
 	return nil
 }
 
-func queryRows(ctx context.Context, pool *pgxpool.Pool, selectQuery string) (pgx.Rows, []string, error) {
-	rows, err := pool.Query(ctx, selectQuery)
-	if err != nil {
-		return nil, nil, err
-	}
+func columnNames(rows pgx.Rows) ([]string, error) {
 	columns := make([]string, 0, len(rows.FieldDescriptions()))
 	for _, fd := range rows.FieldDescriptions() {
 		columns = append(columns, string(fd.Name))
 	}
 	if len(columns) == 0 {
-		rows.Close()
-		return nil, nil, fmt.Errorf("select query returned zero columns")
+		return nil, fmt.Errorf("select query returned zero columns")
 	}
-	return rows, columns, nil
+	return columns, nil
 }
 
 func insertBatch(ctx context.Context, pool *pgxpool.Pool, destTable pgx.Identifier, columns []string, rows [][]any) error {
